@@ -6,6 +6,7 @@ import (
 
 	"passive-asset-discovery/analysis"
 	"passive-asset-discovery/capture"
+	"passive-asset-discovery/fingerprints"
 )
 
 func main() {
@@ -52,7 +53,11 @@ func main() {
 	fmt.Println("Unique devices found:", len(devices))
 	fmt.Println()
 
-	for mac, dev := range devices {
-		fmt.Printf("MAC: %-20s IP: %s\n", mac, dev.IP)
+		for mac, dev := range devices {
+		vendor := fingerprints.LookupVendor(mac)
+		if vendor == "" {
+			vendor = "Unknown"
+		}
+		fmt.Printf("MAC: %-20s IP: %-16s Vendor: %s\n", mac, dev.IP, vendor)
 	}
 }
