@@ -26,9 +26,11 @@ func main() {
 	}
 	defer src.Close()
 
-	devices := make(map[string]analysis.DeviceInfo)
+		devices := make(map[string]analysis.DeviceInfo)
 	firstSeen := make(map[string]time.Time)
 	lastSeen := make(map[string]time.Time)
+	hostnames := make(map[string]string)
+	evidenceMap := make(map[string][]string)
 
 	for {
 		packet, err := src.Next()
@@ -51,20 +53,30 @@ func main() {
 			devices[info.MAC] = info
 		}
 		lastSeen[info.MAC] = ts
+				if hostname, ev, ok := analysis.DHCPHostname(packet); ok {
+			hostnames[info.MAC] = hostname
+			evidenceMap[info.MAC] = append(evidenceMap[info.MAC], ev)
+		}
 	}
 
 	// Build the Asset list in the required JSON shape
 	var assets []analysis.Asset
-	for mac, dev := range devices {
+		for mac, dev := range devices {
 		vendor := fingerprints.LookupVendor(mac)
+
+		evidence := evidenceMap[mac]
+		if vendor != "" {
+			evidence = append(evidence, "mac oui")
+		}
 
 		assets = append(assets, analysis.Asset{
 			IP:         dev.IP,
 			MAC:        mac,
 			Vendor:     vendor,
-			DeviceType: "unknown",   // Week 2 me isko sahi karenge
-			Confidence: "low",       // abhi sirf vendor se guess hai
-			Evidence:   []string{"mac oui"},
+			DeviceType: "unknown",
+			Confidence: "low",
+			Hostname:   hostnames[mac],
+			Evidence:   evidence,
 			FirstSeen:  firstSeen[mac].UTC().Format(time.RFC3339),
 			LastSeen:   lastSeen[mac].UTC().Format(time.RFC3339),
 		})

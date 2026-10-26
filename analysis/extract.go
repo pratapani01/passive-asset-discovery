@@ -33,3 +33,24 @@ func ExtractDevice(packet gopacket.Packet) (DeviceInfo, bool) {
 
 	return info, found
 }
+// DHCPHostname checks if this packet is a DHCP request with a hostname,
+// and returns (hostname, evidence string, true) if found.
+func DHCPHostname(packet gopacket.Packet) (string, string, bool) {
+	dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4)
+	if dhcpLayer == nil {
+		return "", "", false
+	}
+
+	dhcp, ok := dhcpLayer.(*layers.DHCPv4)
+	if !ok {
+		return "", "", false
+	}
+
+	for _, opt := range dhcp.Options {
+		if opt.Type == layers.DHCPOptHostname {
+			return string(opt.Data), "dhcp hostname", true
+		}
+	}
+
+	return "", "", false
+}
