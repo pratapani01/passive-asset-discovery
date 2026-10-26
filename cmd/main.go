@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"passive-asset-discovery/analysis"
 	"passive-asset-discovery/capture"
 )
 
@@ -22,15 +23,36 @@ func main() {
 	}
 	defer src.Close()
 
-	count := 0
+	// MAC address ko key bana ke unique devices store karenge
+	devices := make(map[string]analysis.DeviceInfo)
+
+	packetCount := 0
 	for {
 		packet, err := src.Next()
 		if err != nil {
-			break // file khatam ho gayi
+			break
 		}
-		count++
-		fmt.Println("Packet", count, "-", packet.String()[:80], "...")
+		packetCount++
+
+		info, ok := analysis.ExtractDevice(packet)
+		if !ok || info.MAC == "" {
+			continue // kuch useful nahi mila is packet me
+		}
+
+		// agar ye MAC pehle nahi dekha, ya is baar IP mili hai to update karo
+		existing, seen := devices[info.MAC]
+		if !seen {
+			devices[info.MAC] = info
+		} else if existing.IP == "" && info.IP != "" {
+			devices[info.MAC] = info
+		}
 	}
 
-	fmt.Println("\nTotal packets read:", count)
+	fmt.Println("Total packets read:", packetCount)
+	fmt.Println("Unique devices found:", len(devices))
+	fmt.Println()
+
+	for mac, dev := range devices {
+		fmt.Printf("MAC: %-20s IP: %s\n", mac, dev.IP)
+	}
 }
