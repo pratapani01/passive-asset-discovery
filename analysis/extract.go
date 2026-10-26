@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"strings"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 )
@@ -50,6 +51,29 @@ func DHCPHostname(packet gopacket.Packet) (string, string, bool) {
 		if opt.Type == layers.DHCPOptHostname {
 			return string(opt.Data), "dhcp hostname", true
 		}
+	}
+
+	return "", "", false
+}
+// MDNSClue checks if this packet is an mDNS announcement and returns
+// a device-type guess and evidence string, if recognized.
+func MDNSClue(packet gopacket.Packet) (string, string, bool) {
+	appLayer := packet.ApplicationLayer()
+	if appLayer == nil {
+		return "", "", false
+	}
+
+	payload := string(appLayer.Payload())
+
+	switch {
+	case strings.Contains(payload, "_ipp._tcp"), strings.Contains(payload, "_printer._tcp"):
+		return "printer", "mdns _ipp._tcp", true
+	case strings.Contains(payload, "_rtsp._tcp"):
+		return "ip_camera", "mdns _rtsp._tcp", true
+	case strings.Contains(payload, "_airplay._tcp"), strings.Contains(payload, "_raop._tcp"):
+		return "tv_or_speaker", "mdns _airplay._tcp", true
+	case strings.Contains(payload, "_http._tcp"):
+		return "unknown", "mdns _http._tcp", true
 	}
 
 	return "", "", false

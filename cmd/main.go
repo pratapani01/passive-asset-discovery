@@ -1,3 +1,4 @@
+
 package main
 
 import (
@@ -26,11 +27,12 @@ func main() {
 	}
 	defer src.Close()
 
-		devices := make(map[string]analysis.DeviceInfo)
+	devices := make(map[string]analysis.DeviceInfo)
 	firstSeen := make(map[string]time.Time)
 	lastSeen := make(map[string]time.Time)
 	hostnames := make(map[string]string)
 	evidenceMap := make(map[string][]string)
+	mdnsGuess := make(map[string]string)
 
 	for {
 		packet, err := src.Next()
@@ -52,16 +54,35 @@ func main() {
 		} else if existing.IP == "" && info.IP != "" {
 			devices[info.MAC] = info
 		}
+
 		lastSeen[info.MAC] = ts
-				if hostname, ev, ok := analysis.DHCPHostname(packet); ok {
+
+		// DHCP hostname clue
+		if hostname, ev, ok := analysis.DHCPHostname(packet); ok {
 			hostnames[info.MAC] = hostname
-			evidenceMap[info.MAC] = append(evidenceMap[info.MAC], ev)
+			evidenceMap[info.MAC] = append(
+				evidenceMap[info.MAC],
+				ev,
+			)
+		}
+
+		// mDNS fingerprinting clue
+		if guess, ev, ok := analysis.MDNSClue(packet); ok {
+			evidenceMap[info.MAC] = append(
+				evidenceMap[info.MAC],
+				ev,
+			)
+
+			if guess != "unknown" {
+				mdnsGuess[info.MAC] = guess
+			}
 		}
 	}
 
-	// Build the Asset list in the required JSON shape
+	// Build the Asset list in the required JSON shape.
 	var assets []analysis.Asset
-			for mac, dev := range devices {
+
+	for mac, dev := range devices {
 		vendor := fingerprints.LookupVendor(mac)
 
 		evidence := evidenceMap[mac]
@@ -72,20 +93,32 @@ func main() {
 		deviceType := "unknown"
 		confidence := "low"
 
+		// Initial device-type guess from MAC vendor.
 		if vendor != "" {
 			guessed := fingerprints.GuessTypeFromVendor(vendor)
 			if guessed != "unknown" {
 				deviceType = guessed
-				confidence = "low" // sirf vendor se guess, isliye abhi bhi low
 			}
 		}
 
-		// agar DHCP hostname jaisa koi strong clue mila ho, to confidence badhao
-		if hostnames[mac] != "" {
+		// mDNS can override the vendor-based device-type guess.
+		if mg, ok := mdnsGuess[mac]; ok {
+			deviceType = mg
+			confidence = "medium"
+
+			// Vendor and mDNS evidence are both available.
+			// This is a heuristic, not a guarantee of correctness.
+			if vendor != "" {
+				confidence = "high"
+			}
+		}
+
+		// DHCP hostname provides additional evidence.
+		if hostnames[mac] != "" && confidence == "low" {
 			confidence = "medium"
 		}
 
-		assets = append(assets, analysis.Asset{
+		asset := analysis.Asset{
 			IP:         dev.IP,
 			MAC:        mac,
 			Vendor:     vendor,
@@ -95,7 +128,9 @@ func main() {
 			Evidence:   evidence,
 			FirstSeen:  firstSeen[mac].UTC().Format(time.RFC3339),
 			LastSeen:   lastSeen[mac].UTC().Format(time.RFC3339),
-		})
+		}
+
+		assets = append(assets, asset)
 	}
 
 	output, err := json.MarshalIndent(assets, "", "  ")
