@@ -1,32 +1,26 @@
 [
   {
-    "ip": "192.168.1.2",
-    "mac": "00:80:48:24:33:32",
-    "vendor": "",
+    "ip": "192.168.50.50",
+    "mac": "00:d0:59:6c:40:4e",
+    "vendor": "Entrust Datacard",
     "device_type": "unknown",
     "confidence": "low",
-    "evidence": [],
-    "first_seen": "2005-01-14T01:50:41Z",
-    "last_seen": "2005-01-14T01:51:56Z"
+    "evidence": [
+      "mac oui"
+    ],
+    "first_seen": "2004-09-27T03:18:04Z",
+    "last_seen": "2004-09-27T03:18:04Z"
   },
   {
-    "ip": "192.168.1.3",
-    "mac": "00:0e:35:78:0c:02",
-    "vendor": "",
-    "device_type": "unknown",
+    "ip": "192.168.0.1",
+    "mac": "00:0c:41:82:b2:53",
+    "vendor": "Cisco-Linksys",
+    "device_type": "router",
     "confidence": "low",
-    "evidence": [],
-    "first_seen": "2005-01-14T01:50:16Z",
-    "last_seen": "2005-01-14T01:51:56Z"
-  },
-  {
-    "ip": "192.168.1.1",
-    "mac": "00:90:d0:eb:46:e7",
-    "vendor": "",
-    "device_type": "unknown",
-    "confidence": "low",
-    "evidence": [],
-    "first_seen": "2005-01-14T01:50:16Z",
-    "last_seen": "2005-01-14T01:51:29Z"
+    "evidence": [
+      "mac oui"
+    ],
+    "first_seen": "2004-09-27T03:18:04Z",
+    "last_seen": "2004-09-27T03:18:05Z"
   }
 ]
