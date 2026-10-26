@@ -1,9 +1,9 @@
-
 package main
 
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
@@ -35,7 +35,6 @@ func main() {
 	mdnsGuess := make(map[string]string)
 	httpGuess := make(map[string]string)
 
-	// Process packets from the recorded PCAP file.
 	for {
 		packet, err := src.Next()
 		if err != nil {
@@ -56,37 +55,22 @@ func main() {
 		} else if existing.IP == "" && info.IP != "" {
 			devices[info.MAC] = info
 		}
-
 		lastSeen[info.MAC] = ts
 
-		// DHCP hostname clue.
 		if hostname, ev, ok := analysis.DHCPHostname(packet); ok {
 			hostnames[info.MAC] = hostname
-			evidenceMap[info.MAC] = append(
-				evidenceMap[info.MAC],
-				ev,
-			)
+			evidenceMap[info.MAC] = append(evidenceMap[info.MAC], ev)
 		}
 
-		// mDNS fingerprinting clue.
 		if guess, ev, ok := analysis.MDNSClue(packet); ok {
-			evidenceMap[info.MAC] = append(
-				evidenceMap[info.MAC],
-				ev,
-			)
-
+			evidenceMap[info.MAC] = append(evidenceMap[info.MAC], ev)
 			if guess != "unknown" {
 				mdnsGuess[info.MAC] = guess
 			}
 		}
 
-		// HTTP banner fingerprinting clue.
 		if banner, ev, ok := analysis.HTTPBannerClue(packet); ok {
-			evidenceMap[info.MAC] = append(
-				evidenceMap[info.MAC],
-				ev,
-			)
-
+			evidenceMap[info.MAC] = append(evidenceMap[info.MAC], ev)
 			guess := fingerprints.GuessTypeFromBanner(banner)
 			if guess != "unknown" {
 				httpGuess[info.MAC] = guess
@@ -94,15 +78,14 @@ func main() {
 		}
 	}
 
-	// Build the asset list.
 	var assets []analysis.Asset
-
 	for mac, dev := range devices {
 		vendor := fingerprints.LookupVendor(mac)
 
-		// Copy evidence before appending vendor evidence.
-		evidence := append([]string(nil), evidenceMap[mac]...)
-
+		evidence := evidenceMap[mac]
+		if evidence == nil {
+			evidence = []string{}
+		}
 		if vendor != "" {
 			evidence = append(evidence, "mac oui")
 		}
@@ -110,26 +93,23 @@ func main() {
 		deviceType := "unknown"
 		confidence := "low"
 
-		// Initial guess based on MAC vendor.
 		if vendor != "" {
 			guessed := fingerprints.GuessTypeFromVendor(vendor)
 			if guessed != "unknown" {
 				deviceType = guessed
+				confidence = "low"
 			}
 		}
 
-		// mDNS can override the vendor-based guess.
 		if mg, ok := mdnsGuess[mac]; ok {
-			deviceType = mg
-			confidence = "medium"
-
-			// Vendor information and mDNS evidence are both present.
-			if vendor != "" {
+			if deviceType == "unknown" {
+				deviceType = mg
+				confidence = "medium"
+			} else if mg == deviceType {
 				confidence = "high"
 			}
 		}
 
-		// HTTP banner-based device-type inference.
 		if hg, ok := httpGuess[mac]; ok {
 			if deviceType == "unknown" {
 				deviceType = hg
@@ -139,12 +119,11 @@ func main() {
 			}
 		}
 
-		// DHCP hostname provides additional evidence.
 		if hostnames[mac] != "" && confidence == "low" {
 			confidence = "medium"
 		}
 
-		asset := analysis.Asset{
+		assets = append(assets, analysis.Asset{
 			IP:         dev.IP,
 			MAC:        mac,
 			Vendor:     vendor,
@@ -154,17 +133,27 @@ func main() {
 			Evidence:   evidence,
 			FirstSeen:  firstSeen[mac].UTC().Format(time.RFC3339),
 			LastSeen:   lastSeen[mac].UTC().Format(time.RFC3339),
-		}
-
-		assets = append(assets, asset)
+		})
 	}
 
-	// Convert assets to formatted JSON.
 	output, err := json.MarshalIndent(assets, "", "  ")
 	if err != nil {
 		fmt.Println("Error building JSON:", err)
 		os.Exit(1)
 	}
 
+	// JSON file me save karo (viewer isko load karega)
+	err = os.WriteFile("web/assets.json", output, 0644)
+	if err != nil {
+		fmt.Println("Error saving JSON:", err)
+		os.Exit(1)
+	}
+
 	fmt.Println(string(output))
+	fmt.Println("\nSaved to web/assets.json")
+	fmt.Println("Starting viewer at http://localhost:8080")
+
+	// Simple web server: web folder serve karo
+	http.Handle("/", http.FileServer(http.Dir("web")))
+	http.ListenAndServe(":8080", nil)
 }

@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Passive Asset Discovery - Viewer</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem; background: #f5f5f5; }
+    table { border-collapse: collapse; width: 100%; background: white; }
+    th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+    th { background: #333; color: white; }
+    .high { color: green; font-weight: bold; }
+    .medium { color: orange; }
+    .low { color: gray; }
+  </style>
+</head>
+<body>
+  <h1>Discovered Devices</h1>
+  <table id="deviceTable">
+    <thead>
+      <tr><th>IP</th><th>MAC</th><th>Vendor</th><th>Type</th><th>Confidence</th><th>Hostname</th><th>Evidence</th></tr>
+    </thead>
+    <tbody id="deviceBody"></tbody>
+  </table>
+
+  <script>
+    fetch('/assets.json')
+      .then(res => res.json())
+      .then(assets => {
+        const body = document.getElementById('deviceBody');
+        assets.forEach(a => {
+          const row = document.createElement('tr');
+          row.innerHTML = `
+            <td>${a.ip}</td>
+            <td>${a.mac}</td>
+            <td>${a.vendor || '-'}</td>
+            <td>${a.device_type}</td>
+            <td class="${a.confidence}">${a.confidence}</td>
+            <td>${a.hostname || '-'}</td>
+            <td>${a.evidence.join(', ')}</td>
+          `;
+          body.appendChild(row);
+        });
+      });
+  </script>
+</body>
+</html>
