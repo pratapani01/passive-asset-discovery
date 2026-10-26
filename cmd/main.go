@@ -61,7 +61,7 @@ func main() {
 
 	// Build the Asset list in the required JSON shape
 	var assets []analysis.Asset
-		for mac, dev := range devices {
+			for mac, dev := range devices {
 		vendor := fingerprints.LookupVendor(mac)
 
 		evidence := evidenceMap[mac]
@@ -69,12 +69,28 @@ func main() {
 			evidence = append(evidence, "mac oui")
 		}
 
+		deviceType := "unknown"
+		confidence := "low"
+
+		if vendor != "" {
+			guessed := fingerprints.GuessTypeFromVendor(vendor)
+			if guessed != "unknown" {
+				deviceType = guessed
+				confidence = "low" // sirf vendor se guess, isliye abhi bhi low
+			}
+		}
+
+		// agar DHCP hostname jaisa koi strong clue mila ho, to confidence badhao
+		if hostnames[mac] != "" {
+			confidence = "medium"
+		}
+
 		assets = append(assets, analysis.Asset{
 			IP:         dev.IP,
 			MAC:        mac,
 			Vendor:     vendor,
-			DeviceType: "unknown",
-			Confidence: "low",
+			DeviceType: deviceType,
+			Confidence: confidence,
 			Hostname:   hostnames[mac],
 			Evidence:   evidence,
 			FirstSeen:  firstSeen[mac].UTC().Format(time.RFC3339),
