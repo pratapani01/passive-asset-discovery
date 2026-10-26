@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"passive-asset-discovery/analysis"
 	"passive-asset-discovery/capture"
@@ -24,40 +26,55 @@ func main() {
 	}
 	defer src.Close()
 
-	// MAC address ko key bana ke unique devices store karenge
 	devices := make(map[string]analysis.DeviceInfo)
+	firstSeen := make(map[string]time.Time)
+	lastSeen := make(map[string]time.Time)
 
-	packetCount := 0
 	for {
 		packet, err := src.Next()
 		if err != nil {
 			break
 		}
-		packetCount++
 
 		info, ok := analysis.ExtractDevice(packet)
 		if !ok || info.MAC == "" {
-			continue // kuch useful nahi mila is packet me
+			continue
 		}
 
-		// agar ye MAC pehle nahi dekha, ya is baar IP mili hai to update karo
+		ts := packet.Metadata().Timestamp
+
 		existing, seen := devices[info.MAC]
 		if !seen {
 			devices[info.MAC] = info
+			firstSeen[info.MAC] = ts
 		} else if existing.IP == "" && info.IP != "" {
 			devices[info.MAC] = info
 		}
+		lastSeen[info.MAC] = ts
 	}
 
-	fmt.Println("Total packets read:", packetCount)
-	fmt.Println("Unique devices found:", len(devices))
-	fmt.Println()
-
-		for mac, dev := range devices {
+	// Build the Asset list in the required JSON shape
+	var assets []analysis.Asset
+	for mac, dev := range devices {
 		vendor := fingerprints.LookupVendor(mac)
-		if vendor == "" {
-			vendor = "Unknown"
-		}
-		fmt.Printf("MAC: %-20s IP: %-16s Vendor: %s\n", mac, dev.IP, vendor)
+
+		assets = append(assets, analysis.Asset{
+			IP:         dev.IP,
+			MAC:        mac,
+			Vendor:     vendor,
+			DeviceType: "unknown",   // Week 2 me isko sahi karenge
+			Confidence: "low",       // abhi sirf vendor se guess hai
+			Evidence:   []string{"mac oui"},
+			FirstSeen:  firstSeen[mac].UTC().Format(time.RFC3339),
+			LastSeen:   lastSeen[mac].UTC().Format(time.RFC3339),
+		})
 	}
+
+	output, err := json.MarshalIndent(assets, "", "  ")
+	if err != nil {
+		fmt.Println("Error building JSON:", err)
+		os.Exit(1)
+	}
+
+	fmt.Println(string(output))
 }
