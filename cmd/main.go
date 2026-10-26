@@ -33,7 +33,9 @@ func main() {
 	hostnames := make(map[string]string)
 	evidenceMap := make(map[string][]string)
 	mdnsGuess := make(map[string]string)
+	httpGuess := make(map[string]string)
 
+	// Process packets from the recorded PCAP file.
 	for {
 		packet, err := src.Next()
 		if err != nil {
@@ -57,7 +59,7 @@ func main() {
 
 		lastSeen[info.MAC] = ts
 
-		// DHCP hostname clue
+		// DHCP hostname clue.
 		if hostname, ev, ok := analysis.DHCPHostname(packet); ok {
 			hostnames[info.MAC] = hostname
 			evidenceMap[info.MAC] = append(
@@ -66,7 +68,7 @@ func main() {
 			)
 		}
 
-		// mDNS fingerprinting clue
+		// mDNS fingerprinting clue.
 		if guess, ev, ok := analysis.MDNSClue(packet); ok {
 			evidenceMap[info.MAC] = append(
 				evidenceMap[info.MAC],
@@ -77,15 +79,30 @@ func main() {
 				mdnsGuess[info.MAC] = guess
 			}
 		}
+
+		// HTTP banner fingerprinting clue.
+		if banner, ev, ok := analysis.HTTPBannerClue(packet); ok {
+			evidenceMap[info.MAC] = append(
+				evidenceMap[info.MAC],
+				ev,
+			)
+
+			guess := fingerprints.GuessTypeFromBanner(banner)
+			if guess != "unknown" {
+				httpGuess[info.MAC] = guess
+			}
+		}
 	}
 
-	// Build the Asset list in the required JSON shape.
+	// Build the asset list.
 	var assets []analysis.Asset
 
 	for mac, dev := range devices {
 		vendor := fingerprints.LookupVendor(mac)
 
-		evidence := evidenceMap[mac]
+		// Copy evidence before appending vendor evidence.
+		evidence := append([]string(nil), evidenceMap[mac]...)
+
 		if vendor != "" {
 			evidence = append(evidence, "mac oui")
 		}
@@ -93,7 +110,7 @@ func main() {
 		deviceType := "unknown"
 		confidence := "low"
 
-		// Initial device-type guess from MAC vendor.
+		// Initial guess based on MAC vendor.
 		if vendor != "" {
 			guessed := fingerprints.GuessTypeFromVendor(vendor)
 			if guessed != "unknown" {
@@ -101,14 +118,23 @@ func main() {
 			}
 		}
 
-		// mDNS can override the vendor-based device-type guess.
+		// mDNS can override the vendor-based guess.
 		if mg, ok := mdnsGuess[mac]; ok {
 			deviceType = mg
 			confidence = "medium"
 
-			// Vendor and mDNS evidence are both available.
-			// This is a heuristic, not a guarantee of correctness.
+			// Vendor information and mDNS evidence are both present.
 			if vendor != "" {
+				confidence = "high"
+			}
+		}
+
+		// HTTP banner-based device-type inference.
+		if hg, ok := httpGuess[mac]; ok {
+			if deviceType == "unknown" {
+				deviceType = hg
+				confidence = "medium"
+			} else if hg == deviceType {
 				confidence = "high"
 			}
 		}
@@ -133,6 +159,7 @@ func main() {
 		assets = append(assets, asset)
 	}
 
+	// Convert assets to formatted JSON.
 	output, err := json.MarshalIndent(assets, "", "  ")
 	if err != nil {
 		fmt.Println("Error building JSON:", err)

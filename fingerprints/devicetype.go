@@ -22,3 +22,18 @@ func GuessTypeFromVendor(vendor string) string {
 		return "unknown"
 	}
 }
+// GuessTypeFromBanner makes a guess based on an HTTP Server banner text.
+func GuessTypeFromBanner(banner string) string {
+	b := strings.ToLower(banner)
+
+	switch {
+	case strings.Contains(b, "hikvision"), strings.Contains(b, "ipcam"), strings.Contains(b, "dahua"):
+		return "ip_camera"
+	case strings.Contains(b, "cups"), strings.Contains(b, "printer"):
+		return "printer"
+	case strings.Contains(b, "router"), strings.Contains(b, "openwrt"), strings.Contains(b, "dd-wrt"):
+		return "router"
+	default:
+		return "unknown"
+	}
+}

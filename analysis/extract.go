@@ -78,3 +78,27 @@ func MDNSClue(packet gopacket.Packet) (string, string, bool) {
 
 	return "", "", false
 }
+// HTTPBannerClue checks for an HTTP response with a Server header,
+// and returns it as evidence (raw banner text, caller decides device type).
+func HTTPBannerClue(packet gopacket.Packet) (string, string, bool) {
+	appLayer := packet.ApplicationLayer()
+	if appLayer == nil {
+		return "", "", false
+	}
+
+	payload := string(appLayer.Payload())
+
+	if !strings.Contains(payload, "Server:") {
+		return "", "", false
+	}
+
+	lines := strings.Split(payload, "\r\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "Server:") {
+			banner := strings.TrimSpace(strings.TrimPrefix(line, "Server:"))
+			return banner, "http banner: " + banner, true
+		}
+	}
+
+	return "", "", false
+}
