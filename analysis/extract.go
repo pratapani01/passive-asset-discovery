@@ -1,7 +1,9 @@
 package analysis
 
 import (
+	"net"
 	"strings"
+
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 )
@@ -26,14 +28,19 @@ func ExtractDevice(packet gopacket.Packet) (DeviceInfo, bool) {
 	}
 
 	// IP address: comes from the IPv4 layer
+	// IP address: comes from the IPv4 layer
 	if ipLayer := packet.Layer(layers.LayerTypeIPv4); ipLayer != nil {
 		ip, _ := ipLayer.(*layers.IPv4)
-		info.IP = ip.SrcIP.String()
+		// sirf ghar/office ke private IP lo, public ya 0.0.0.0 nahi
+		if ip.SrcIP.IsPrivate() && !ip.SrcIP.IsUnspecified() {
+			info.IP = ip.SrcIP.String()
+		}
 		found = true
 	}
 
 	return info, found
 }
+
 // DHCPHostname checks if this packet is a DHCP request with a hostname,
 // and returns (hostname, evidence string, true) if found.
 func DHCPHostname(packet gopacket.Packet) (string, string, bool) {
@@ -55,6 +62,7 @@ func DHCPHostname(packet gopacket.Packet) (string, string, bool) {
 
 	return "", "", false
 }
+
 // MDNSClue checks if this packet is an mDNS announcement and returns
 // a device-type guess and evidence string, if recognized.
 func MDNSClue(packet gopacket.Packet) (string, string, bool) {
@@ -78,6 +86,7 @@ func MDNSClue(packet gopacket.Packet) (string, string, bool) {
 
 	return "", "", false
 }
+
 // HTTPBannerClue checks for an HTTP response with a Server header,
 // and returns it as evidence (raw banner text, caller decides device type).
 func HTTPBannerClue(packet gopacket.Packet) (string, string, bool) {
@@ -101,4 +110,43 @@ func HTTPBannerClue(packet gopacket.Packet) (string, string, bool) {
 	}
 
 	return "", "", false
+}
+
+// ARPClue returns the sender's MAC and IP from an ARP packet.
+// Devices say "my IP is X and my MAC is Y" in ARP, even when they send
+// no other IP traffic.
+func ARPClue(packet gopacket.Packet) (string, string, bool) {
+	arpLayer := packet.Layer(layers.LayerTypeARP)
+	if arpLayer == nil {
+		return "", "", false
+	}
+	arp, ok := arpLayer.(*layers.ARP)
+	if !ok {
+		return "", "", false
+	}
+
+	mac := net.HardwareAddr(arp.SourceHwAddress).String()
+	ip := net.IP(arp.SourceProtAddress)
+	if ip.IsUnspecified() || !ip.IsPrivate() {
+		return "", "", false
+	}
+	return mac, ip.String(), true
+}
+
+// DHCPRequestedIP returns the IP a device asks for in a DHCP request.
+func DHCPRequestedIP(packet gopacket.Packet) (string, bool) {
+	dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4)
+	if dhcpLayer == nil {
+		return "", false
+	}
+	dhcp, ok := dhcpLayer.(*layers.DHCPv4)
+	if !ok {
+		return "", false
+	}
+	for _, opt := range dhcp.Options {
+		if opt.Type == layers.DHCPOptRequestIP && len(opt.Data) == 4 {
+			return net.IP(opt.Data).String(), true
+		}
+	}
+	return "", false
 }
