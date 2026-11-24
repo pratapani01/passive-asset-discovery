@@ -1,152 +1,135 @@
 package analysis
 
 import (
+	"bytes"
 	"net"
 	"strings"
+	"unicode"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 )
 
-// DeviceInfo holds what we learned about one device from a packet.
 type DeviceInfo struct {
 	IP  string
 	MAC string
 }
 
-// ExtractDevice pulls IP and MAC addresses out of a single packet.
-// Returns ok=false if the packet doesn't have useful info.
+func validSenderMAC(mac net.HardwareAddr) bool {
+	if len(mac) != 6 || mac[0]&0x01 != 0 {
+		return false
+	}
+	return !bytes.Equal(mac, make([]byte, 6))
+}
+
+func cleanText(raw []byte, limit int) string {
+	s := strings.ToValidUTF8(string(raw), "")
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) {
+			return r
+		}
+		return -1
+	}, s)
+	s = strings.TrimSpace(s)
+
+	if runes := []rune(s); len(runes) > limit {
+		s = string(runes[:limit])
+	}
+	return s
+}
+
 func ExtractDevice(packet gopacket.Packet) (DeviceInfo, bool) {
-	var info DeviceInfo
-	found := false
-
-	// MAC address: comes from the Ethernet layer
-	if ethLayer := packet.Layer(layers.LayerTypeEthernet); ethLayer != nil {
-		eth, _ := ethLayer.(*layers.Ethernet)
-		info.MAC = eth.SrcMAC.String()
-		found = true
+	eth, ok := packet.Layer(layers.LayerTypeEthernet).(*layers.Ethernet)
+	if !ok || !validSenderMAC(eth.SrcMAC) {
+		return DeviceInfo{}, false
 	}
 
-	// IP address: comes from the IPv4 layer
-	// IP address: comes from the IPv4 layer
-	if ipLayer := packet.Layer(layers.LayerTypeIPv4); ipLayer != nil {
-		ip, _ := ipLayer.(*layers.IPv4)
-		// sirf ghar/office ke private IP lo, public ya 0.0.0.0 nahi
-		if ip.SrcIP.IsPrivate() && !ip.SrcIP.IsUnspecified() {
-			info.IP = ip.SrcIP.String()
-		}
-		found = true
+	info := DeviceInfo{MAC: eth.SrcMAC.String()}
+
+	if ip, ok := packet.Layer(layers.LayerTypeIPv4).(*layers.IPv4); ok && ip.SrcIP.IsPrivate() {
+		info.IP = ip.SrcIP.String()
 	}
 
-	return info, found
+	return info, true
 }
 
-// DHCPHostname checks if this packet is a DHCP request with a hostname,
-// and returns (hostname, evidence string, true) if found.
-func DHCPHostname(packet gopacket.Packet) (string, string, bool) {
-	dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4)
-	if dhcpLayer == nil {
-		return "", "", false
-	}
-
-	dhcp, ok := dhcpLayer.(*layers.DHCPv4)
-	if !ok {
-		return "", "", false
-	}
-
-	for _, opt := range dhcp.Options {
-		if opt.Type == layers.DHCPOptHostname {
-			return string(opt.Data), "dhcp hostname", true
-		}
-	}
-
-	return "", "", false
-}
-
-// MDNSClue checks if this packet is an mDNS announcement and returns
-// a device-type guess and evidence string, if recognized.
-func MDNSClue(packet gopacket.Packet) (string, string, bool) {
-	appLayer := packet.ApplicationLayer()
-	if appLayer == nil {
-		return "", "", false
-	}
-
-	payload := string(appLayer.Payload())
-
-	switch {
-	case strings.Contains(payload, "_ipp._tcp"), strings.Contains(payload, "_printer._tcp"):
-		return "printer", "mdns _ipp._tcp", true
-	case strings.Contains(payload, "_rtsp._tcp"):
-		return "ip_camera", "mdns _rtsp._tcp", true
-	case strings.Contains(payload, "_airplay._tcp"), strings.Contains(payload, "_raop._tcp"):
-		return "tv_or_speaker", "mdns _airplay._tcp", true
-	case strings.Contains(payload, "_http._tcp"):
-		return "unknown", "mdns _http._tcp", true
-	}
-
-	return "", "", false
-}
-
-// HTTPBannerClue checks for an HTTP response with a Server header,
-// and returns it as evidence (raw banner text, caller decides device type).
-func HTTPBannerClue(packet gopacket.Packet) (string, string, bool) {
-	appLayer := packet.ApplicationLayer()
-	if appLayer == nil {
-		return "", "", false
-	}
-
-	payload := string(appLayer.Payload())
-
-	if !strings.Contains(payload, "Server:") {
-		return "", "", false
-	}
-
-	lines := strings.Split(payload, "\r\n")
-	for _, line := range lines {
-		if strings.HasPrefix(line, "Server:") {
-			banner := strings.TrimSpace(strings.TrimPrefix(line, "Server:"))
-			return banner, "http banner: " + banner, true
-		}
-	}
-
-	return "", "", false
-}
-
-// ARPClue returns the sender's MAC and IP from an ARP packet.
-// Devices say "my IP is X and my MAC is Y" in ARP, even when they send
-// no other IP traffic.
 func ARPClue(packet gopacket.Packet) (string, string, bool) {
-	arpLayer := packet.Layer(layers.LayerTypeARP)
-	if arpLayer == nil {
-		return "", "", false
-	}
-	arp, ok := arpLayer.(*layers.ARP)
-	if !ok {
+	arp, ok := packet.Layer(layers.LayerTypeARP).(*layers.ARP)
+	if !ok || len(arp.SourceHwAddress) != 6 || len(arp.SourceProtAddress) != 4 {
 		return "", "", false
 	}
 
-	mac := net.HardwareAddr(arp.SourceHwAddress).String()
+	mac := net.HardwareAddr(arp.SourceHwAddress)
 	ip := net.IP(arp.SourceProtAddress)
-	if ip.IsUnspecified() || !ip.IsPrivate() {
+	if !validSenderMAC(mac) || !ip.IsPrivate() {
 		return "", "", false
 	}
-	return mac, ip.String(), true
+
+	return mac.String(), ip.String(), true
 }
 
-// DHCPRequestedIP returns the IP a device asks for in a DHCP request.
-func DHCPRequestedIP(packet gopacket.Packet) (string, bool) {
-	dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4)
-	if dhcpLayer == nil {
-		return "", false
+func dhcpMessage(packet gopacket.Packet, op layers.DHCPOp) (*layers.DHCPv4, bool) {
+	dhcp, ok := packet.Layer(layers.LayerTypeDHCPv4).(*layers.DHCPv4)
+	if !ok || dhcp.Operation != op {
+		return nil, false
 	}
-	dhcp, ok := dhcpLayer.(*layers.DHCPv4)
+	return dhcp, true
+}
+
+func dhcpOption(dhcp *layers.DHCPv4, code layers.DHCPOpt) ([]byte, bool) {
+	for _, opt := range dhcp.Options {
+		if opt.Type == code {
+			return opt.Data, true
+		}
+	}
+	return nil, false
+}
+
+func DHCPHostname(packet gopacket.Packet) (string, string, bool) {
+	dhcp, ok := dhcpMessage(packet, layers.DHCPOpRequest)
+	if !ok {
+		return "", "", false
+	}
+
+	data, found := dhcpOption(dhcp, layers.DHCPOptHostname)
+	if !found {
+		return "", "", false
+	}
+
+	name := cleanText(data, 64)
+	if name == "" {
+		return "", "", false
+	}
+	return name, "dhcp hostname", true
+}
+
+func DHCPRequestedIP(packet gopacket.Packet) (string, bool) {
+	dhcp, ok := dhcpMessage(packet, layers.DHCPOpRequest)
 	if !ok {
 		return "", false
 	}
-	for _, opt := range dhcp.Options {
-		if opt.Type == layers.DHCPOptRequestIP && len(opt.Data) == 4 {
-			return net.IP(opt.Data).String(), true
-		}
+
+	data, found := dhcpOption(dhcp, layers.DHCPOptRequestIP)
+	if !found || len(data) != 4 || !net.IP(data).IsPrivate() {
+		return "", false
 	}
-	return "", false
+	return net.IP(data).String(), true
+}
+
+func DHCPSubnetMask(packet gopacket.Packet) (net.IPMask, bool) {
+	dhcp, ok := dhcpMessage(packet, layers.DHCPOpReply)
+	if !ok {
+		return nil, false
+	}
+
+	data, found := dhcpOption(dhcp, layers.DHCPOptSubnetMask)
+	if !found || len(data) != 4 {
+		return nil, false
+	}
+
+	mask := net.IPMask(append([]byte(nil), data...))
+	if ones, bits := mask.Size(); bits != 32 || ones == 0 {
+		return nil, false
+	}
+	return mask, true
 }

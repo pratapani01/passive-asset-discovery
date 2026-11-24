@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html>
 <head>
@@ -92,19 +91,21 @@
       const status = document.getElementById('status');
 
       try {
-        // Network summary
         const nres = await fetch('/network.json', {
           cache: 'no-store'
         });
 
         const n = await nres.json();
 
+        const subnet = n.subnet
+          ? n.subnet + ' (' + n.subnet_source + ')'
+          : 'detecting...';
+
         document.getElementById('network').textContent =
-          'Subnet: ' + (n.subnet || 'detecting...') +
+          'Subnet: ' + subnet +
           '  |  Gateway: ' + (n.gateway || 'detecting...') +
           '  |  Devices: ' + n.device_count;
 
-        // Device list
         const res = await fetch('/assets.json', {
           cache: 'no-store'
         });

@@ -1,6 +1,5 @@
 package analysis
 
-// Asset matches the exact JSON shape required by the project spec.
 type Asset struct {
 	IP         string   `json:"ip"`
 	MAC        string   `json:"mac"`

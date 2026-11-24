@@ -1,46 +1,62 @@
 package capture
 
 import (
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/pcapgo"
+	"bufio"
+	"bytes"
+	"fmt"
 	"os"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcapgo"
 )
 
-// PCAPSource reads packets from a .pcap file.
+var pcapngMagic = []byte{0x0a, 0x0d, 0x0d, 0x0a}
+
+type linkReader interface {
+	gopacket.PacketDataSource
+	LinkType() layers.LinkType
+}
+
 type PCAPSource struct {
 	file   *os.File
-	reader *pcapgo.Reader
 	source *gopacket.PacketSource
 }
 
-// NewPCAPSource opens a pcap file and gets it ready to read.
 func NewPCAPSource(path string) (*PCAPSource, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 
-	r, err := pcapgo.NewReader(f)
+	buffered := bufio.NewReaderSize(f, 1<<20)
+	magic, err := buffered.Peek(len(pcapngMagic))
 	if err != nil {
 		f.Close()
-		return nil, err
+		return nil, fmt.Errorf("%s is not a capture file: %w", path, err)
 	}
 
-	ps := gopacket.NewPacketSource(r, r.LinkType())
+	var reader linkReader
+	if bytes.Equal(magic, pcapngMagic) {
+		reader, err = pcapgo.NewNgReader(buffered, pcapgo.DefaultNgReaderOptions)
+	} else {
+		reader, err = pcapgo.NewReader(buffered)
+	}
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
 
-	return &PCAPSource{
-		file:   f,
-		reader: r,
-		source: ps,
-	}, nil
+	source := gopacket.NewPacketSource(reader, reader.LinkType())
+	source.DecodeOptions = gopacket.Lazy
+
+	return &PCAPSource{file: f, source: source}, nil
 }
 
-// Next returns the next packet, or an error (io.EOF when the file ends).
 func (p *PCAPSource) Next() (gopacket.Packet, error) {
 	return p.source.NextPacket()
 }
 
-// Close closes the underlying file.
 func (p *PCAPSource) Close() error {
 	return p.file.Close()
 }
