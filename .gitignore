@@ -1,3 +1,6 @@
-testdata/home.pcap
-web/assets.json
 build/
+testdata/home.pcap
+testdata/home.pcapng
+testdata/*.local.*
+web/assets.json
+*.exe
