@@ -2,12 +2,18 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"sort"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/gopacket"
@@ -15,366 +21,372 @@ import (
 	"passive-asset-discovery/analysis"
 	"passive-asset-discovery/capture"
 	"passive-asset-discovery/fingerprints"
+	"passive-asset-discovery/web"
 )
 
-const tsharkPath = `C:\Program Files\Wireshark\tshark.exe`
-
-// Tracker collects everything we learn about each device.
-// The mutex protects shared data between packet capture and web server.
-type Tracker struct {
-	mu          sync.Mutex
-	devices     map[string]analysis.DeviceInfo
-	firstSeen   map[string]time.Time
-	lastSeen    map[string]time.Time
-	hostnames   map[string]string
-	evidenceMap map[string][]string
-	mdnsGuess   map[string]string
-	httpGuess   map[string]string
-
-	ports      map[string]map[int]bool
-	gatewayMAC string
+type device struct {
+	ip        string
+	firstSeen time.Time
+	lastSeen  time.Time
+	hostname  string
+	evidence  []string
+	ports     map[int]bool
+	mdnsGuess string
+	httpGuess string
+	ssdpGuess string
 }
 
-func NewTracker() *Tracker {
-	return &Tracker{
-		devices:     make(map[string]analysis.DeviceInfo),
-		firstSeen:   make(map[string]time.Time),
-		lastSeen:    make(map[string]time.Time),
-		hostnames:   make(map[string]string),
-		evidenceMap: make(map[string][]string),
-		mdnsGuess:   make(map[string]string),
-		httpGuess:   make(map[string]string),
-
-		ports: make(map[string]map[int]bool),
-	}
-}
-
-func (t *Tracker) addEvidence(mac, ev string) {
-	for _, e := range t.evidenceMap[mac] {
+func (d *device) addEvidence(ev string) {
+	for _, e := range d.evidence {
 		if e == ev {
 			return
 		}
 	}
-
-	t.evidenceMap[mac] = append(t.evidenceMap[mac], ev)
+	d.evidence = append(d.evidence, ev)
 }
 
-// setIP records an IP for a MAC if we don't have one yet.
-func (t *Tracker) setIP(mac, ip string, ts time.Time) {
-	dev, seen := t.devices[mac]
-
-	if !seen {
-		t.devices[mac] = analysis.DeviceInfo{
-			MAC: mac,
-			IP:  ip,
-		}
-		t.firstSeen[mac] = ts
-		t.lastSeen[mac] = ts
-		return
-	}
-
-	if dev.IP == "" {
-		dev.IP = ip
-		t.devices[mac] = dev
+func (d *device) setIP(ip string) {
+	if d.ip == "" {
+		d.ip = ip
 	}
 }
 
-// Add learns from one packet.
+type Tracker struct {
+	mu         sync.Mutex
+	devices    map[string]*device
+	gatewayMAC string
+	subnetMask net.IPMask
+}
+
+func NewTracker() *Tracker {
+	return &Tracker{devices: make(map[string]*device)}
+}
+
+func (t *Tracker) entry(mac string, ts time.Time) *device {
+	d, ok := t.devices[mac]
+	if !ok {
+		d = &device{firstSeen: ts, lastSeen: ts, ports: make(map[int]bool)}
+		t.devices[mac] = d
+	}
+	return d
+}
+
+func keepKnown(current, guess string) string {
+	if guess == "" || guess == "unknown" {
+		return current
+	}
+	return guess
+}
+
+func combine(current, confidence, guess string) (string, string) {
+	if guess == "" || guess == "unknown" {
+		return current, confidence
+	}
+	if current == "unknown" {
+		return guess, "medium"
+	}
+	if guess == current {
+		return current, "high"
+	}
+	return current, confidence
+}
+
 func (t *Tracker) Add(packet gopacket.Packet) {
 	info, ok := analysis.ExtractDevice(packet)
-	if !ok || info.MAC == "" {
+	if !ok {
 		return
 	}
+	ts := packet.Metadata().Timestamp
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Detect gateway MAC
-	if gw, ok := analysis.PublicSourceMAC(packet); ok {
-		t.gatewayMAC = gw
+	if mac, ok := analysis.PublicSourceMAC(packet); ok {
+		t.gatewayMAC = mac
+	}
+	if mask, ok := analysis.DHCPSubnetMask(packet); ok {
+		t.subnetMask = mask
 	}
 
-	// Collect TCP port clues
-	// Only count devices having an IP address
+	d := t.entry(info.MAC, ts)
+	d.lastSeen = ts
+
 	if info.IP != "" {
+		d.setIP(info.IP)
 		if port, ok := analysis.OpenPortClue(packet); ok {
-			if t.ports[info.MAC] == nil {
-				t.ports[info.MAC] = make(map[int]bool)
-			}
-			t.ports[info.MAC][port] = true
+			d.ports[port] = true
 		}
 	}
 
-	ts := packet.Metadata().Timestamp
-
-	existing, seen := t.devices[info.MAC]
-	if !seen {
-		t.devices[info.MAC] = info
-		t.firstSeen[info.MAC] = ts
-	} else if existing.IP == "" && info.IP != "" {
-		t.devices[info.MAC] = info
-	}
-
-	t.lastSeen[info.MAC] = ts
-
-	// ARP IP discovery
 	if mac, ip, ok := analysis.ARPClue(packet); ok {
-		t.setIP(mac, ip, ts)
+		t.entry(mac, ts).setIP(ip)
 	}
-
-	// DHCP requested IP discovery
 	if ip, ok := analysis.DHCPRequestedIP(packet); ok {
-		t.setIP(info.MAC, ip, ts)
+		d.setIP(ip)
 	}
 
-	// DHCP hostname discovery
-	if hostname, ev, ok := analysis.DHCPHostname(packet); ok {
-		t.hostnames[info.MAC] = hostname
-		t.addEvidence(info.MAC, ev)
+	if name, ev, ok := analysis.DHCPHostname(packet); ok {
+		d.hostname = name
+		d.addEvidence(ev)
+	}
+	if name, ok := analysis.MDNSHostname(packet); ok && d.hostname == "" {
+		d.hostname = name
+		d.addEvidence("mdns hostname")
 	}
 
-	// mDNS identification
 	if guess, ev, ok := analysis.MDNSClue(packet); ok {
-		t.addEvidence(info.MAC, ev)
-
-		if guess != "unknown" {
-			t.mdnsGuess[info.MAC] = guess
-		}
+		d.addEvidence(ev)
+		d.mdnsGuess = keepKnown(d.mdnsGuess, guess)
 	}
-
-	// HTTP banner identification
 	if banner, ev, ok := analysis.HTTPBannerClue(packet); ok {
-		t.addEvidence(info.MAC, ev)
-
-		guess := fingerprints.GuessTypeFromBanner(banner)
-		if guess != "unknown" {
-			t.httpGuess[info.MAC] = guess
-		}
+		d.addEvidence(ev)
+		d.httpGuess = keepKnown(d.httpGuess, fingerprints.GuessTypeFromBanner(banner))
+	}
+	if guess, ev, ok := analysis.SSDPClue(packet); ok {
+		d.addEvidence(ev)
+		d.ssdpGuess = keepKnown(d.ssdpGuess, guess)
 	}
 }
 
-// Snapshot builds the current sorted device list.
 func (t *Tracker) Snapshot() []analysis.Asset {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	assets := []analysis.Asset{}
+	assets := make([]analysis.Asset, 0, len(t.devices))
 
-	for mac, dev := range t.devices {
+	for mac, d := range t.devices {
 		vendor := fingerprints.LookupVendor(mac)
+		evidence := append([]string{}, d.evidence...)
 
-		evidence := append([]string{}, t.evidenceMap[mac]...)
-
+		deviceType, confidence := "unknown", "low"
 		if vendor != "" {
 			evidence = append(evidence, "mac oui")
-		}
-
-		deviceType := "unknown"
-		confidence := "low"
-
-		// Vendor-based identification
-		if vendor != "" {
-			if guessed := fingerprints.GuessTypeFromVendor(vendor); guessed != "unknown" {
-				deviceType = guessed
+			if guess := fingerprints.GuessTypeFromVendor(vendor); guess != "unknown" {
+				deviceType = guess
 			}
 		}
 
-		// mDNS identification
-		if mg, ok := t.mdnsGuess[mac]; ok {
-			if deviceType == "unknown" {
-				deviceType = mg
-				confidence = "medium"
-			} else if mg == deviceType {
-				confidence = "high"
-			}
+		hostnameGuess := ""
+		if d.hostname != "" {
+			hostnameGuess = fingerprints.GuessTypeFromHostname(d.hostname)
+		}
+		for _, guess := range []string{d.mdnsGuess, d.httpGuess, d.ssdpGuess, hostnameGuess} {
+			deviceType, confidence = combine(deviceType, confidence, guess)
 		}
 
-		// HTTP banner identification
-		if hg, ok := t.httpGuess[mac]; ok {
-			if deviceType == "unknown" {
-				deviceType = hg
-				confidence = "medium"
-			} else if hg == deviceType {
-				confidence = "high"
-			}
-		}
-
-		// Hostname identification
-		if t.hostnames[mac] != "" {
-			if ht := fingerprints.GuessTypeFromHostname(t.hostnames[mac]); ht != "unknown" {
-				if deviceType == "unknown" {
-					deviceType = ht
-					confidence = "medium"
-				} else if ht == deviceType {
-					confidence = "high"
-				}
-			}
-		}
-
-		// Add port evidence
-		ports := []int{}
-
-		for p := range t.ports[mac] {
+		ports := make([]int, 0, len(d.ports))
+		for p := range d.ports {
 			ports = append(ports, p)
 		}
-
 		sort.Ints(ports)
-
 		for _, p := range ports {
-			evidence = append(
-				evidence,
-				fmt.Sprintf("open port %d/tcp", p),
-			)
+			evidence = append(evidence, fmt.Sprintf("open port %d/tcp", p))
 		}
 
-		// Identify private/random MAC
 		if analysis.IsPrivateMAC(mac) {
 			evidence = append(evidence, "private (random) mac")
 		}
 
-		// Identify gateway
 		if t.gatewayMAC != "" && mac == t.gatewayMAC {
 			evidence = append(evidence, "default gateway")
-
-			if deviceType == "unknown" {
-				deviceType = "router"
-				confidence = "medium"
-			}
+			deviceType, confidence = combine(deviceType, confidence, "router")
 		}
 
 		assets = append(assets, analysis.Asset{
-			IP:         dev.IP,
+			IP:         d.ip,
 			MAC:        mac,
 			Vendor:     vendor,
 			DeviceType: deviceType,
 			Confidence: confidence,
-			Hostname:   t.hostnames[mac],
+			Hostname:   d.hostname,
 			Evidence:   evidence,
-			FirstSeen:  t.firstSeen[mac].UTC().Format(time.RFC3339),
-			LastSeen:   t.lastSeen[mac].UTC().Format(time.RFC3339),
+			FirstSeen:  d.firstSeen.UTC().Format(time.RFC3339),
+			LastSeen:   d.lastSeen.UTC().Format(time.RFC3339),
 		})
 	}
 
-	sort.Slice(assets, func(i, j int) bool {
-		return assets[i].MAC < assets[j].MAC
-	})
-
+	sort.Slice(assets, func(i, j int) bool { return assets[i].MAC < assets[j].MAC })
 	return assets
 }
 
-// NetworkInfo contains a summary of the discovered network.
 type NetworkInfo struct {
-	Subnet      string `json:"subnet"`
-	Gateway     string `json:"gateway"`
-	GatewayMAC  string `json:"gateway_mac"`
-	DeviceCount int    `json:"device_count"`
+	Subnet       string `json:"subnet"`
+	SubnetSource string `json:"subnet_source"`
+	Gateway      string `json:"gateway"`
+	GatewayMAC   string `json:"gateway_mac"`
+	DeviceCount  int    `json:"device_count"`
 }
 
-// Network summarises the network.
-// Subnet assumes a /24, which is typical for a home router.
 func (t *Tracker) Network() NetworkInfo {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	info := NetworkInfo{
-		GatewayMAC:  t.gatewayMAC,
-		DeviceCount: len(t.devices),
+	info := NetworkInfo{GatewayMAC: t.gatewayMAC, DeviceCount: len(t.devices)}
+
+	gw, ok := t.devices[t.gatewayMAC]
+	if !ok || gw.ip == "" {
+		return info
+	}
+	info.Gateway = gw.ip
+
+	ip := net.ParseIP(gw.ip).To4()
+	if ip == nil {
+		return info
 	}
 
-	if gw, ok := t.devices[t.gatewayMAC]; ok && gw.IP != "" {
-		info.Gateway = gw.IP
-
-		if ip := net.ParseIP(gw.IP).To4(); ip != nil {
-			info.Subnet = fmt.Sprintf(
-				"%d.%d.%d.0/24",
-				ip[0], ip[1], ip[2],
-			)
-		}
+	mask, source := t.subnetMask, "dhcp"
+	if mask == nil {
+		mask, source = net.CIDRMask(24, 32), "assumed /24"
 	}
-
+	ones, _ := mask.Size()
+	info.Subnet = fmt.Sprintf("%s/%d", ip.Mask(mask), ones)
+	info.SubnetSource = source
 	return info
 }
 
-// readPackets feeds every packet from the source to the tracker.
-// For a file it ends at the end of the file; for live it runs until stopped.
-func readPackets(src capture.PacketSource, t *Tracker) {
+func readPackets(src capture.PacketSource, t *Tracker) error {
 	for {
 		packet, err := src.Next()
 		if err != nil {
-			return
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
 		}
-
 		t.Add(packet)
 	}
 }
 
+func encodeJSON(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+func writeResponse(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := encodeJSON(w, v); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func fatal(msg string) {
+	fmt.Fprintln(os.Stderr, "error:", msg)
+	os.Exit(1)
+}
+
+func usage() {
+	fmt.Fprint(os.Stderr, `Usage:
+  passive-scan [flags] <capture.pcap | capture.pcapng>
+  passive-scan [flags] live [interface]
+
+Flags:
+`)
+	flag.PrintDefaults()
+}
+
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage:")
-		fmt.Println("  go run ./cmd/main.go <file.pcap>")
-		fmt.Println("  go run ./cmd/main.go live [interface-name]")
-		os.Exit(1)
+	addr := flag.String("addr", "127.0.0.1:8080", "address the web viewer listens on")
+	tshark := flag.String("tshark", "", "path to tshark (live mode only, found automatically if empty)")
+	noWeb := flag.Bool("no-web", false, "capture file mode: print the JSON and exit without starting the viewer")
+	flag.Usage = usage
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) == 0 {
+		usage()
+		os.Exit(2)
 	}
 
 	tracker := NewTracker()
+	stop := func() {}
 
-	if os.Args[1] == "live" {
-		iface := "Wi-Fi"
-
-		if len(os.Args) >= 3 {
-			iface = os.Args[2]
+	if args[0] == "live" {
+		iface := capture.DefaultInterface()
+		if len(args) > 1 {
+			iface = args[1]
+		}
+		if iface == "" {
+			fatal("no default interface on this system, pass one (for example: passive-scan live wlan0). List them with: tshark -D")
 		}
 
-		src, err := capture.NewLiveSource(tsharkPath, iface)
+		tsharkBin, err := capture.FindTshark(*tshark)
 		if err != nil {
-			fmt.Println("Error starting live capture:", err)
-			os.Exit(1)
+			fatal(err.Error())
+		}
+		src, err := capture.NewLiveSource(tsharkBin, iface)
+		if err != nil {
+			fatal(err.Error())
 		}
 
-		defer src.Close()
+		stop = func() { src.Close() }
 
-		go readPackets(src, tracker)
+		go func() {
+			err := readPackets(src, tracker)
+			msg := "capture stopped"
+			if err != nil {
+				msg += ": " + err.Error()
+			}
+			if diag := src.Diagnostics(); diag != "" {
+				msg += " (" + diag + ")"
+			}
+			fmt.Fprintln(os.Stderr, msg)
+		}()
 
-		fmt.Println("Listening live on:", iface, "(passive only)")
+		fmt.Fprintf(os.Stderr, "Listening on %s (passive, nothing is sent)\n", iface)
 	} else {
-		src, err := capture.NewPCAPSource(os.Args[1])
+		src, err := capture.NewPCAPSource(args[0])
 		if err != nil {
-			fmt.Println("Error opening pcap:", err)
-			os.Exit(1)
+			fatal(err.Error())
+		}
+		err = readPackets(src, tracker)
+		src.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "warning: capture ended early:", err)
 		}
 
-		readPackets(src, tracker)
-		src.Close()
-
-		out, _ := json.MarshalIndent(tracker.Snapshot(), "", "  ")
-		fmt.Println(string(out))
-	}
-
-	// Assets endpoint
-	http.HandleFunc("/assets.json", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
-
-		out, err := json.MarshalIndent(tracker.Snapshot(), "", "  ")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		if err := encodeJSON(os.Stdout, tracker.Snapshot()); err != nil {
+			fatal(err.Error())
+		}
+		if *noWeb {
 			return
 		}
+	}
 
-		w.Write(out)
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-interrupt
+		stop()
+		os.Exit(0)
+	}()
+
+	files := http.FileServer(http.FS(web.Files))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/assets.json", func(w http.ResponseWriter, r *http.Request) {
+		writeResponse(w, tracker.Snapshot())
+	})
+	mux.HandleFunc("/network.json", func(w http.ResponseWriter, r *http.Request) {
+		writeResponse(w, tracker.Network())
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.Redirect(w, r, "/viewer.html", http.StatusFound)
+			return
+		}
+		files.ServeHTTP(w, r)
 	})
 
-	// Network summary endpoint
-	http.HandleFunc("/network.json", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
+	shown := *addr
+	if strings.HasPrefix(shown, ":") {
+		shown = "localhost" + shown
+	}
+	fmt.Fprintf(os.Stderr, "Viewer: http://%s/viewer.html (Ctrl+C to stop)\n", shown)
 
-		json.NewEncoder(w).Encode(tracker.Network())
-	})
-
-	// Serve dashboard
-	http.Handle("/", http.FileServer(http.Dir("web")))
-
-	fmt.Println("Viewer: http://localhost:8080/viewer.html  (Ctrl+C to stop)")
-	http.ListenAndServe(":8080", nil)
+	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	if err := srv.ListenAndServe(); err != nil {
+		stop()
+		fatal(err.Error())
+	}
 }
